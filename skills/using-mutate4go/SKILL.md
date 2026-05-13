@@ -48,6 +48,9 @@ mutate4go internal/foo/foo.go --mutate-all
 
 # Reuse existing coverage data without refreshing it
 mutate4go internal/foo/foo.go --reuse-coverage
+
+# Run mutations in parallel with isolated workers
+mutate4go internal/foo/foo.go --max-workers 3
 ```
 
 The tool automatically:
@@ -55,6 +58,7 @@ The tool automatically:
 - Runs coverage with `go test ./... -coverprofile=target/coverage/coverage.out`
 - Runs a baseline test command, defaulting to `go test ./...`
 - Applies each mutation, runs tests with a timeout, and restores the source file
+- Runs mutations in parallel with isolated worker directories when `--max-workers` is greater than `1`
 - Writes an embedded footer manifest with `tested_at` and function hashes after a run
 - Defaults to differential mutation when that footer manifest already exists
 - Can reuse existing coverage data with `--reuse-coverage`
@@ -87,7 +91,7 @@ Use `--update-manifest` when you want to accept the current file contents as the
 
 1. Run `go test ./...`.
 2. Run `mutate4go path/to/file.go --scan`.
-3. Run `mutate4go path/to/file.go`.
+3. Run `mutate4go path/to/file.go --max-workers 3`.
 4. Review survivors and uncovered mutations.
 5. Write tests to kill survivors and cover uncovered sites.
 6. Retest focused lines with `mutate4go path/to/file.go --lines 45,67`.

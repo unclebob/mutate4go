@@ -51,7 +51,7 @@ mutate4go internal/foo/foo.go --timeout-factor 15
 # Use a custom test command
 mutate4go internal/foo/foo.go --test-command "go test ./internal/foo"
 
-# Accepted for workflow compatibility; mutation runs are currently serialized
+# Run mutations in parallel with isolated workers
 mutate4go internal/foo/foo.go --max-workers 4
 
 # Show help
@@ -63,6 +63,7 @@ The tool automatically:
 - Runs coverage with `go test ./... -coverprofile=target/coverage/coverage.out`
 - Runs a baseline test command, defaulting to `go test ./...`
 - Applies each covered mutation, runs tests with a timeout, and restores the original file
+- Runs mutations in parallel with isolated worker directories when `--max-workers` is greater than `1`
 - Writes an embedded footer manifest with the last test date and function hashes
 - Defaults to differential mutation when that footer manifest already exists
 - Prints a warning when mutation count exceeds `--mutation-warning` (default `50`)
@@ -88,7 +89,7 @@ mutate4go internal/foo/foo.go
 
 Recommended loop for each file:
 
-1. Run `mutate4go path/to/file.go`.
+1. Run `mutate4go path/to/file.go --max-workers 3`.
 2. If any mutations are uncovered, add or fix tests until they are covered.
 3. If any mutations survive, change code or tests until they are killed.
 4. Rerun the same single-file mutation command.

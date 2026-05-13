@@ -21,7 +21,7 @@ Options:
   --mutation-warning N   Warn when more than N mutations are found (default 50)
   --timeout-factor N     Mutation timeout multiplier vs baseline (default 10)
   --test-command CMD     Test command to run (default "go test ./...")
-  --max-workers N        Accepted for workflow compatibility; runs are serialized
+  --max-workers N        Run mutations in parallel using N isolated workers
   --help                 Print this help and exit
 `
 

@@ -3,11 +3,13 @@ package runner
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/unclebob/mutate4go/internal/cli"
@@ -132,7 +134,10 @@ func Mutate(options cli.Options) error {
 		return err
 	}
 	defer manifest.CleanupBackup(options.SourcePath)
-	results := runMutations(options.SourcePath, analysisContent, selected, timeout, options.TestCommand)
+	results, err := runMutations(options.SourcePath, analysisContent, selected, timeout, options.TestCommand, options.MaxWorkers)
+	if err != nil {
+		return err
+	}
 	if err := os.WriteFile(options.SourcePath, []byte(analysisContent), 0o644); err != nil {
 		return err
 	}
@@ -180,26 +185,148 @@ func baseline(command string) (time.Duration, error) {
 	return time.Since(start), err
 }
 
-func runMutations(sourcePath, original string, sites []mutations.Site, timeout time.Duration, testCommand string) []Result {
+func runMutations(sourcePath, original string, sites []mutations.Site, timeout time.Duration, testCommand string, maxWorkers int) ([]Result, error) {
+	if maxWorkers <= 1 || len(sites) <= 1 {
+		return runMutationsSerial(sourcePath, original, sites, timeout, testCommand)
+	}
+	return runMutationsParallel(sourcePath, original, sites, timeout, testCommand, maxWorkers)
+}
+
+func runMutationsSerial(sourcePath, original string, sites []mutations.Site, timeout time.Duration, testCommand string) ([]Result, error) {
 	var results []Result
 	total := len(sites)
 	for i, site := range sites {
 		mutated := mutations.Apply(original, site)
-		_ = os.WriteFile(sourcePath, []byte(mutated), 0o644)
+		if err := os.WriteFile(sourcePath, []byte(mutated), 0o644); err != nil {
+			return nil, err
+		}
 		start := time.Now()
-		status := runMutant(testCommand, timeout)
+		status := runMutant(testCommand, timeout, "")
 		result := Result{Site: site, Status: status, Duration: time.Since(start)}
 		results = append(results, result)
-		_ = os.WriteFile(sourcePath, []byte(original), 0o644)
+		if err := os.WriteFile(sourcePath, []byte(original), 0o644); err != nil {
+			return nil, err
+		}
 		fmt.Printf("[%d/%d] %s line %d %s: %s\n", i+1, total, status, site.Line, site.Description, site.FunctionID)
 	}
+	return results, nil
+}
+
+func runMutationsParallel(sourcePath, original string, sites []mutations.Site, timeout time.Duration, testCommand string, maxWorkers int) ([]Result, error) {
+	root, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	absSource, err := filepath.Abs(sourcePath)
+	if err != nil {
+		return nil, err
+	}
+	relSource, err := filepath.Rel(root, absSource)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasPrefix(relSource, ".."+string(os.PathSeparator)) || relSource == ".." || filepath.IsAbs(relSource) {
+		return nil, fmt.Errorf("source file must be inside working directory for parallel mutation: %s", sourcePath)
+	}
+
+	if maxWorkers > len(sites) {
+		maxWorkers = len(sites)
+	}
+	runRoot := filepath.Join(root, "target", "mutation-workers", fmt.Sprintf("run-%d-%d", os.Getpid(), time.Now().UnixNano()))
+	defer os.RemoveAll(runRoot)
+
+	type job struct {
+		Number int
+		Site   mutations.Site
+	}
+	type worker struct {
+		Root       string
+		SourcePath string
+	}
+	workers := make([]worker, maxWorkers)
+	for i := range workers {
+		workerRoot := filepath.Join(runRoot, fmt.Sprintf("worker-%d", i+1))
+		if err := copyProject(root, workerRoot); err != nil {
+			return nil, err
+		}
+		workers[i] = worker{
+			Root:       workerRoot,
+			SourcePath: filepath.Join(workerRoot, relSource),
+		}
+	}
+
+	jobs := make(chan job, len(sites))
+	for i, site := range sites {
+		jobs <- job{Number: i + 1, Site: site}
+	}
+	close(jobs)
+
+	results := make(chan Result, len(sites))
+	errs := make(chan error, 1)
+	var wg sync.WaitGroup
+	for i, w := range workers {
+		wg.Add(1)
+		go func(workerNumber int, w worker) {
+			defer wg.Done()
+			for job := range jobs {
+				mutated := mutations.Apply(original, job.Site)
+				if err := os.WriteFile(w.SourcePath, []byte(mutated), 0o644); err != nil {
+					sendFirstError(errs, err)
+					return
+				}
+				start := time.Now()
+				status := runMutant(testCommand, timeout, w.Root)
+				if err := os.WriteFile(w.SourcePath, []byte(original), 0o644); err != nil {
+					sendFirstError(errs, err)
+					return
+				}
+				results <- Result{Site: job.Site, Status: status, Duration: time.Since(start)}
+				fmt.Printf("[%d/%d] worker-%d %s line %d %s: %s\n", job.Number, len(sites), workerNumber, status, job.Site.Line, job.Site.Description, job.Site.FunctionID)
+			}
+		}(i+1, w)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	collected := make([]Result, 0, len(sites))
+	for result := range results {
+		collected = append(collected, result)
+	}
+	select {
+	case err := <-errs:
+		return nil, err
+	default:
+	}
+	if len(collected) != len(sites) {
+		return nil, fmt.Errorf("mutation workers stopped after %d/%d results", len(collected), len(sites))
+	}
+	return sortResults(collected), nil
+}
+
+func sendFirstError(errs chan<- error, err error) {
+	select {
+	case errs <- err:
+	default:
+	}
+}
+
+func sortResults(results []Result) []Result {
+	sort.SliceStable(results, func(i, j int) bool {
+		return results[i].Site.Index < results[j].Site.Index
+	})
 	return results
 }
 
-func runMutant(command string, timeout time.Duration) string {
+func runMutant(command string, timeout time.Duration, dir string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	if dir != "" {
+		cmd.Dir = dir
+	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
@@ -210,6 +337,77 @@ func runMutant(command string, timeout time.Duration) string {
 		return "killed"
 	}
 	return "survived"
+}
+
+func copyProject(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return os.MkdirAll(dst, 0o755)
+		}
+		if shouldSkipCopy(rel, entry) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		target := filepath.Join(dst, rel)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case entry.IsDir():
+			return os.MkdirAll(target, info.Mode().Perm())
+		case info.Mode()&os.ModeSymlink != 0:
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(link, target)
+		case info.Mode().IsRegular():
+			return copyFile(path, target, info.Mode().Perm())
+		default:
+			return nil
+		}
+	})
+}
+
+func shouldSkipCopy(rel string, entry os.DirEntry) bool {
+	if rel == ".git" || strings.HasPrefix(rel, ".git"+string(os.PathSeparator)) {
+		return true
+	}
+	if rel == filepath.Join("target", "mutation-workers") ||
+		strings.HasPrefix(rel, filepath.Join("target", "mutation-workers")+string(os.PathSeparator)) {
+		return true
+	}
+	return false
+}
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 func partitionByCoverage(profile map[string][]coverage.Segment, sourcePath string, sites []mutations.Site) ([]mutations.Site, []mutations.Site) {
@@ -271,7 +469,7 @@ func printHeader(options cli.Options, all, covered, uncovered, selected []mutati
 		fmt.Printf("Warning: %d mutation sites exceeds threshold %d.\n", len(all), options.MutationWarning)
 	}
 	if options.MaxWorkers > 0 {
-		fmt.Println("Note: --max-workers is accepted for workflow compatibility; mutate4go currently serializes source mutations.")
+		fmt.Printf("Mutation workers: %d\n", options.MaxWorkers)
 	}
 }
 
